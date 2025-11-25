@@ -1,0 +1,182 @@
+// 请求路径。请修改此路径，避免该 worker 所有人都能使用。
+const endpointPath = '/cfns';
+
+// 多个上游 DoH（必需是域名形式的 URL）
+const upstreamList = [
+  'https://dns.cloudflare.com/dns-query',
+  'https://cloudflare-dns.com/dns-query',
+];
+
+// 缓存最近一次可用上游的索引（减小每次轮询开销）
+let cachedIndex = -1;
+let cacheExpiresAt = 0;
+const CACHE_TTL_MS = 20 * 1000; // 缓存 上游DNS的可用状态20 秒
+
+// 尝试使用一个上游去 fetch，返回 Response 或抛出错误
+async function tryFetchUpstream(upstreamUrlString, fetchRequestOptions) {
+  // upstreamUrlString: 完整的 DoH URL 字符串（GET时包含查询参数）
+  // fetchRequestOptions: { method, headers, body } 等
+  try {
+    // Worker 上的 fetch 可以直接使用 URL（必须是域名而非裸 IP）
+    const resp = await fetch(upstreamUrlString, fetchRequestOptions);
+    // 只要上游返回 200-299 或仍然返回 application/dns-message（例如 200/204 都可）
+    if (resp && (resp.status >= 200 && resp.status < 300)) {
+      return resp;
+    }
+    // 某些上游可能返回 4xx/5xx，认为失败并尝试下一个
+    return null;
+  } catch (e) {
+    // 网络错误或 DNS 解析等异常
+    return null;
+  }
+}
+
+// 按顺序尝试上游（优先尝试 cache），GET/POST 都通用
+async function fetchWithFallback(buildUpstreamForIndex) {
+  const now = Date.now();
+  // 先尝试缓存的上游
+  if (cachedIndex >= 0 && now < cacheExpiresAt && cachedIndex < upstreamList.length) {
+    const upstream = upstreamList[cachedIndex];
+    const upstreamUrl = buildUpstreamForIndex(upstream);
+    const resp = await tryFetchUpstream(upstreamUrl, { method: 'GET', headers: {} }); // real options由调用处替换
+    if (resp) return { resp, usedIndex: cachedIndex };
+    // 如果缓存上游失败，继续尝试其它上游（并会刷新缓存）
+  }
+
+  // 顺序尝试所有上游
+  for (let i = 0; i < upstreamList.length; i++) {
+    const upstream = upstreamList[i];
+    const upstreamUrl = buildUpstreamForIndex(upstream);
+    // 注意：buildUpstreamForIndex 必须返回完整的 URL 字符串或 Request 对象，下一步 tryFetchUpstream 会处理
+    const resp = await tryFetchUpstream(upstreamUrl, { method: 'GET', headers: {} });
+    if (resp) {
+      // 更新缓存
+      cachedIndex = i;
+      cacheExpiresAt = Date.now() + CACHE_TTL_MS;
+      return { resp, usedIndex: i };
+    }
+  }
+  // 全部失败
+  return { resp: null, usedIndex: -1 };
+}
+
+// 处理 GET 请求：/cfns?dns=BASE64_DNS
+async function handleRequestGet(request, clientUrl) {
+  const dnsValue = clientUrl.searchParams.get('dns');
+  if (!dnsValue) return new Response('missing parameters', { status: 400 });
+
+  if (request.headers.get('accept') !== 'application/dns-message') {
+    return new Response('bad request header', { status: 400 });
+  }
+
+  // buildUpstreamForIndex：给出每个 upstream 基于原上游构造出的 GET URL（包含 ?dns=...）
+  const buildFn = (upstreamBase) => {
+    const u = new URL(upstreamBase);
+    u.searchParams.set('dns', dnsValue);
+    return u.toString();
+  };
+
+  // 按顺序尝试上游（并优先用缓存）
+  for (let i = 0; i < upstreamList.length; i++) {
+    // 优化：先尝试缓存项
+    let candidateIndices = [];
+    if (cachedIndex >= 0 && Date.now() < cacheExpiresAt) {
+      candidateIndices.push(cachedIndex);
+      for (let j = 0; j < upstreamList.length; j++) if (j !== cachedIndex) candidateIndices.push(j);
+    } else {
+      candidateIndices = Array.from(upstreamList.keys());
+    }
+
+    for (const idx of candidateIndices) {
+      const upstreamUrl = buildFn(upstreamList[idx]);
+      // 构造 headers（保留客户端的一些头）
+      const headers = new Headers();
+      // 只保留必要的 header 避免上游拒绝（但保留 accept 和 user-agent）
+      headers.set('accept', 'application/dns-message');
+      const ua = request.headers.get('user-agent');
+      if (ua) headers.set('user-agent', ua);
+      // 设置 host 头为上游主机名（某些上游要求）
+      try {
+        const uParsed = new URL(upstreamUrl);
+        headers.set('host', uParsed.hostname);
+      } catch (e) {}
+
+      try {
+        const resp = await fetch(upstreamUrl, { method: 'GET', headers });
+        if (resp && resp.status >= 200 && resp.status < 300) {
+          // 成功：更新缓存并返回
+          cachedIndex = idx;
+          cacheExpiresAt = Date.now() + CACHE_TTL_MS;
+          return resp;
+        }
+      } catch (e) {
+        // 当前上游失败，继续下一个
+      }
+    }
+    break; // we've tried candidate order once, break outer loop
+  }
+
+  return new Response('All upstream DoH servers failed', { status: 502 });
+}
+
+// 处理 POST 请求（body = binary DNS message）
+async function handleRequestPost(request, clientUrl) {
+  if (request.headers.get('content-type') !== 'application/dns-message') {
+    return new Response('bad request header', { status: 400 });
+  }
+
+  const bodyBuf = await request.arrayBuffer();
+
+  // 优先尝试缓存的上游，然后再按顺序
+  let candidateIndices;
+  if (cachedIndex >= 0 && Date.now() < cacheExpiresAt) {
+    candidateIndices = [cachedIndex, ...Array.from(upstreamList.keys()).filter(i => i !== cachedIndex)];
+  } else {
+    candidateIndices = Array.from(upstreamList.keys());
+  }
+
+  for (const idx of candidateIndices) {
+    const upstream = upstreamList[idx];
+    const headers = {
+      'accept': 'application/dns-message',
+      'content-type': 'application/dns-message'
+    };
+    // try fetch
+    try {
+      const resp = await fetch(upstream, {
+        method: 'POST',
+        headers,
+        body: bodyBuf
+      });
+      if (resp && resp.status >= 200 && resp.status < 300) {
+        cachedIndex = idx;
+        cacheExpiresAt = Date.now() + CACHE_TTL_MS;
+        return resp;
+      }
+    } catch (e) {
+      // 上游失败，尝试下一个
+    }
+  }
+
+  return new Response('All upstream DoH servers failed', { status: 502 });
+}
+
+// 统一入口
+async function handleRequest(request) {
+  const clientUrl = new URL(request.url);
+  if (clientUrl.pathname !== endpointPath) {
+    return new Response('Not found', { status: 404 });
+  }
+
+  if (request.method === 'GET') {
+    return handleRequestGet(request, clientUrl);
+  } else if (request.method === 'POST') {
+    return handleRequestPost(request, clientUrl);
+  } else {
+    return new Response('method not allowed', { status: 405 });
+  }
+}
+
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
