@@ -3,69 +3,65 @@ const endpointPath = '/dns-query';
 // 上游 DoH 地址。必需是域名，不能是 IP。Cloudflare 有限制。
 const upstream = 'https://dns.google/dns-query';
 
-/**
- * @param {Request} request
- * @param {URL} clientUrl
- */
+const CF_OPTIONS = {
+  cacheEverything: true,
+  cacheTtl: 60,              // 可调，建议 30~120 秒
+  httpProtocol: "http2",     // h2/h3 优先
+};
+
+async function forwardToDoH(urlOrReq) {
+  return await fetch(urlOrReq, { cf: CF_OPTIONS });
+}
+
 async function handleRequestGet(request, clientUrl) {
-  const dnsValue = clientUrl.searchParams.get('dns')
-
-  if (dnsValue == null) {
+  const dnsValue = clientUrl.searchParams.get('dns');
+  if (!dnsValue)
     return new Response('missing parameters', { status: 400 });
-  }
-
-  if (request.headers.get('accept') != 'application/dns-message') {
-    return new Response('bad request header', { status: 400 });
-  }
 
   const upstreamUrl = new URL(upstream);
   upstreamUrl.searchParams.set('dns', dnsValue);
-  const upstreamRequest = new Request(upstreamUrl.toString(), {
-    headers: request.headers,
+
+  const req = new Request(upstreamUrl.toString(), {
     method: 'GET',
+    headers: {
+      'accept': 'application/dns-message'
+    }
   });
-  upstreamRequest.headers.set('host', upstreamUrl.hostname)
-  return await fetch(upstreamRequest);
+
+  return forwardToDoH(req);
 }
 
-/**
- * @param {Request} request
- * @param {URL} clientUrl
- */
-async function handleRequestPost(request, clientUrl) {
-  if (request.headers.get('content-type') != 'application/dns-message') {
-    return new Response('bad request header', { status: 400 });
-  }
-  const upstreamRequest = new Request(upstream, {
+async function handleRequestPost(request) {
+  const body = await request.arrayBuffer();
+
+  const req = new Request(upstream, {
     method: 'POST',
     headers: {
       'accept': 'application/dns-message',
       'content-type': 'application/dns-message',
     },
-    body: await request.arrayBuffer()
+    body,
   });
-  return await fetch(upstreamRequest);
+
+  return forwardToDoH(req);
 }
 
-/**
- * @param {Request} request
- */
 async function handleRequest(request) {
-  const clientUrl = new URL(request.url);
-  if (clientUrl.pathname != endpointPath) {
-    return new Response('Hello World!', { status: 404 });
+  const url = new URL(request.url);
+
+  if (url.pathname !== endpointPath) {
+    return new Response('404 not found', { status: 404 });
   }
 
-  switch (request.method) {
-    case 'GET':
-      return handleRequestGet(request, clientUrl)
-    case 'POST':
-      return handleRequestPost(request, clientUrl)
-    default:
-      return new Response('method not allowed', { status: 405 });
-  }
+  if (request.method === 'GET')
+    return handleRequestGet(request, url);
+
+  if (request.method === 'POST')
+    return handleRequestPost(request);
+
+  return new Response('method not allowed', { status: 405 });
 }
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
+addEventListener('fetch', e => {
+  e.respondWith(handleRequest(e.request));
 });
