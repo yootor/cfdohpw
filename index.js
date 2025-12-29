@@ -1,68 +1,76 @@
 // 请求路径。请修改此路径，避免该 worker 所有人都能使用。
 const endpointPath = '/dns-query';
-// 上游 DoH 地址。必需是域名，不能是 IP。Cloudflare 有限制。
-// https://cloudflare-dns.com/dns-query,https://dns.google/dns-query
 const upstream = 'https://cloudflare-dns.com/dns-query';
+const upstreamHost = 'cloudflare-dns.com';
 
+// 如果你确实不需要缓存，可以将下方的 cf 对象删除或设置 cacheTtl 为 0
 const CF_OPTIONS = {
   cacheEverything: true,
-  cacheTtl: 60,              // 可调，建议 30~120 秒
-  httpProtocol: "http2",     // h2/h3 优先
+  cacheTtl: 60, // 建议至少保留 60 秒
+  httpProtocol: "http2",
 };
 
-async function forwardToDoH(urlOrReq) {
-  return await fetch(urlOrReq, { cf: CF_OPTIONS });
-}
+// 预定义 CORS 头部，减少函数内重复创建
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Accept',
+  'Access-Control-Max-Age': '86400',
+};
 
-async function handleRequestGet(request, clientUrl) {
-  const dnsValue = clientUrl.searchParams.get('dns');
-  if (!dnsValue)
-    return new Response('missing parameters', { status: 400 });
+export default {
+  async fetch(request, env, ctx) {
+    const clientUrl = new URL(request.url);
 
-  const upstreamUrl = new URL(upstream);
-  upstreamUrl.searchParams.set('dns', dnsValue);
-
-  const req = new Request(upstreamUrl.toString(), {
-    method: 'GET',
-    headers: {
-      'accept': 'application/dns-message'
+    // 1. 路径拦截
+    if (clientUrl.pathname !== endpointPath) {
+      return new Response('Hello World!', { status: 404 });
     }
-  });
 
-  return forwardToDoH(req);
-}
+    // 2. 预检请求处理 (处理浏览器 CORS 的关键)
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
 
-async function handleRequestPost(request) {
-  const body = await request.arrayBuffer();
+    let response;
+    const method = request.method;
 
-  const req = new Request(upstream, {
-    method: 'POST',
-    headers: {
-      'accept': 'application/dns-message',
-      'content-type': 'application/dns-message',
-    },
-    body,
-  });
+    // 3. 业务逻辑
+    if (method === 'GET') {
+      const dnsValue = clientUrl.searchParams.get('dns');
+      if (!dnsValue) return new Response('missing parameters', { status: 400, headers: CORS_HEADERS });
+      
+      // 注意：部分客户端 Accept 可能不规范，这里不做强制死锁检查以提高兼容性
+      
+      response = await fetch(`${upstream}?dns=${dnsValue}`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/dns-message' },
+        cf: CF_OPTIONS
+      });
+    } 
+    else if (method === 'POST') {
+      // 优化：不再使用 arrayBuffer()，直接透传 request.body 流，实现零拷贝
+      response = await fetch(upstream, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/dns-message',
+          'Content-Type': 'application/dns-message',
+        },
+        body: request.body, 
+        cf: CF_OPTIONS
+      });
+    } 
+    else {
+      return new Response('method not allowed', { status: 405, headers: CORS_HEADERS });
+    }
 
-  return forwardToDoH(req);
-}
+    // 4. 统一注入 CORS 头并返回
+    const finalHeaders = new Headers(response.headers);
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => finalHeaders.set(k, v));
 
-async function handleRequest(request) {
-  const url = new URL(request.url);
-
-  if (url.pathname !== endpointPath) {
-    return new Response('404 not found', { status: 404 });
+    return new Response(response.body, {
+      status: response.status,
+      headers: finalHeaders
+    });
   }
-
-  if (request.method === 'GET')
-    return handleRequestGet(request, url);
-
-  if (request.method === 'POST')
-    return handleRequestPost(request);
-
-  return new Response('method not allowed', { status: 405 });
-}
-
-addEventListener('fetch', e => {
-  e.respondWith(handleRequest(e.request));
-});
+};
