@@ -1,5 +1,5 @@
 // 请求路径。请修改此路径，避免该 worker 所有人都能使用。
-const endpointPath = '/cfns';
+const endpointPath = '/dns-query';
 
 // 多个上游 DoH（必需是域名形式的 URL）
 const upstreamList = [
@@ -180,3 +180,4 @@ async function handleRequest(request) {
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request));
 });
+
