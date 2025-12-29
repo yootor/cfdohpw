@@ -4,7 +4,7 @@
  */
 
 // 1. 配置项：请修改此路径以保护您的服务不被滥用
-const ENDPOINT_PATH = '/cfns'; 
+const endpointPath = '/dns-query'; 
 const UPSTREAM_URL = 'https://dns.cloudflare.com/dns-query';
 
 // 2. 缓存配置：提高边缘节点命中率
@@ -61,4 +61,5 @@ export default {
     // 拒绝其他 HTTP 方法
     return new Response('Method Not Allowed', { status: 405 });
   }
+
 };
